@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/gob"
@@ -9,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/google/go-github/v70/github"
+	"golang.org/x/oauth2"
 )
 
 type userRepoLink struct {
@@ -18,21 +20,43 @@ type userRepoLink struct {
 }
 
 type config struct {
-	AnchorTextsMap map[string]bool
-	LinksMap       map[string]userRepoLink
+	RepoMap map[string]userRepoLink
+	Secret  string
 }
 
 func main() {
-	// Create the config, maybe later load from file
-	anchorTextsMap := make(map[string]bool)
-	linksMap := make(map[string]userRepoLink)
-	config := config{
-		AnchorTextsMap: anchorTextsMap,
-		LinksMap:       linksMap,
+	err := os.Mkdir("out", 0750)
+	if err != nil {
+		fmt.Printf("Error: creating directory: %v\n", err)
 	}
-	// Create client a github api client
+	// Create the config, maybe later load from file
+
+	repoMap, err := readLinkFile()
+	if err != nil {
+		fmt.Printf("cant load link map using empty map: %v", err)
+	}
+
+	secret, err := os.ReadFile("secrets")
+	if err != nil {
+		fmt.Printf("failed to read secrets: %v\n", err)
+	}
+	secretString := string(secret)
+	secretString = strings.Trim(secretString, " ")
+	secretString = strings.Trim(secretString, "\n")
+	config := config{
+		RepoMap: repoMap,
+		Secret:  secretString,
+	}
+
 	context := context.Background()
-	client := github.NewClient(nil)
+	// Create oauth2 client so we can authenticate with github
+	ts := oauth2.StaticTokenSource(&oauth2.Token{AccessToken: config.Secret})
+	tc := oauth2.NewClient(context, ts)
+
+	// Create a github api client
+
+	client := github.NewClient(tc)
+
 	// InitiateRepo
 	intialRepo := "https://github.com/sindresorhus/awesome"
 
@@ -40,41 +64,56 @@ func main() {
 	if err != nil {
 		fmt.Printf("Error initializaing program: %v\n", err)
 	}
-	initialUserRepo.Checked = true
-	config.LinksMap[intialRepo] = initialUserRepo
-	initialContent, err := getReadme(context, client, initialUserRepo.User, initialUserRepo.Repo)
+	initialContent, err := config.getReadme(context, client, initialUserRepo.User, initialUserRepo.Repo)
 	if err != nil {
 		fmt.Printf("failed to get readme: %v", err)
 		return
 	}
 	config.saveLinksAndTextFromReadme(initialContent)
-
 	// work through links until it throws an error this will happen when no new links are to be found
-	noLinks := false
-	for !noLinks {
+	endProcess := false
+	for !endProcess {
 		workingList, err := config.userRepoList()
 		if err != nil {
 			fmt.Printf("error creating workingList: %v\n", err)
-			noLinks = true
+			endProcess = true
 			continue
 		}
-		config.processList(workingList, context, client)
+		err = config.processList(workingList, context, client)
+		if err != nil {
+			if strings.Contains(err.Error(), "403") {
+				fmt.Printf("error processing list: %v\n", err)
+				endProcess = true
+			}
+		}
 	}
 	err = config.saveLinkFile()
 	if err != nil {
 		fmt.Printf("failed to save linkfile:%v\n", err)
 	}
-	err = config.saveAnchorMap()
+}
+
+func readLinkFile() (map[string]userRepoLink, error) {
+	m := make(map[string]userRepoLink)
+	_, err := os.Stat("/home/obegarde/workspace/github.com/obegarde/gh-readme-downloader/out/linkFile")
 	if err != nil {
-		fmt.Printf("failed to save anchorFile: %v\n", err)
+		return m, err
 	}
+	file, err := os.Open("/home/obegarde/workspace/github.com/obegarde/gh-readme-downloader/out/linkFile")
+	if err != nil {
+		return m, err
+	}
+	defer file.Close()
+	reader := bufio.NewReader(file)
+	dec := gob.NewDecoder(reader)
+	err = dec.Decode(&m)
+	if err != nil {
+		return m, err
+	}
+	return m, nil
 }
 
 func (config config) saveLinkFile() error {
-	err := os.Mkdir("out", 0750)
-	if err != nil {
-		fmt.Printf("Error: creating directory: %v\n", err)
-	}
 	file, err := os.Create("out/linkFile")
 	if err != nil {
 		return err
@@ -82,7 +121,7 @@ func (config config) saveLinkFile() error {
 	defer file.Close()
 	buffer := new(bytes.Buffer)
 	encoder := gob.NewEncoder(buffer)
-	err = encoder.Encode(config.LinksMap)
+	err = encoder.Encode(config.RepoMap)
 	if err != nil {
 		return err
 	}
@@ -90,55 +129,42 @@ func (config config) saveLinkFile() error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("bytes written for anchorfile: %v\n", wBytes)
+	fmt.Printf("bytes written for linkFile: %v\n", wBytes)
 	return nil
 }
 
-func (config config) saveAnchorMap() error {
-	err := os.Mkdir("out", 0750)
+func saveReadMe(readme string, owner string, repo string) error {
+	filepath := fmt.Sprintf("out/%v%v", owner, repo)
+	content := []byte(readme)
+	err := os.WriteFile(filepath, content, 0644)
 	if err != nil {
 		return err
 	}
-	anchorFile, err := os.Create("out/wordsFile")
-	if err != nil {
-		return err
-	}
-	defer anchorFile.Close()
-	buffer := new(bytes.Buffer)
-	encoder := gob.NewEncoder(buffer)
-	err = encoder.Encode(config.AnchorTextsMap)
-	if err != nil {
-		return err
-	}
-	wBytes, err := anchorFile.Write(buffer.Bytes())
-	if err != nil {
-		return err
-	}
-	fmt.Printf("bytes written for anchorfile: %v\n", wBytes)
 	return nil
 }
 
-func (cfg config) processList(input []userRepoLink, context context.Context, client *github.Client) {
+func (config config) processList(input []userRepoLink, context context.Context, client *github.Client) error {
 	for _, val := range input {
-		currentContent, err := getReadme(context, client, val.User, val.Repo)
+		currentContent, err := config.getReadme(context, client, val.User, val.Repo)
 		if err != nil {
+			if strings.Contains(err.Error(), "403") {
+				return err
+			}
 			fmt.Printf("error when processing and getting readme: %v\n", err)
 			continue
 		}
-		cfg.saveLinksAndTextFromReadme(currentContent)
+		config.saveLinksAndTextFromReadme(currentContent)
 	}
+	return nil
 }
 
 func (cfg config) userRepoList() ([]userRepoLink, error) {
 	outList := []userRepoLink{}
-	for key, val := range cfg.LinksMap {
+	for _, val := range cfg.RepoMap {
 		if val.Checked {
 			continue
 		}
 		outList = append(outList, val)
-		currentUserRepo := val
-		currentUserRepo.Checked = true
-		cfg.LinksMap[key] = currentUserRepo
 	}
 	if len(outList) == 0 {
 		return nil, fmt.Errorf("no unchecked links")
@@ -161,12 +187,7 @@ func (cfg config) saveLinksAndTextFromReadme(readme string) error {
 		if string(line[0]) != "-" {
 			continue
 		}
-		anchorText, err := extractAnchorText(line)
-		if err != nil {
-			fmt.Printf("Error: %v", err)
-			continue
-		}
-		cfg.AnchorTextsMap[anchorText] = true
+
 		link, err := extractLink(line)
 		if link == "" {
 			continue
@@ -175,7 +196,7 @@ func (cfg config) saveLinksAndTextFromReadme(readme string) error {
 			fmt.Printf("Error: %v", err)
 			continue
 		}
-		_, ok := cfg.LinksMap[link]
+		_, ok := cfg.RepoMap[link]
 		if ok {
 			continue
 		}
@@ -184,7 +205,7 @@ func (cfg config) saveLinksAndTextFromReadme(readme string) error {
 			fmt.Printf("error getting user and repo: %v\n", err)
 			continue
 		}
-		cfg.LinksMap[link] = linkInfo
+		cfg.RepoMap[link] = linkInfo
 	}
 	return nil
 }
@@ -223,7 +244,7 @@ func extractLink(line string) (string, error) {
 	return link, nil
 }
 
-func getReadme(ctx context.Context, client *github.Client, owner, repo string) (string, error) {
+func (config config) getReadme(ctx context.Context, client *github.Client, owner, repo string) (string, error) {
 	// gets the readme and retunts it as a string
 	readme, _, err := client.Repositories.GetReadme(ctx, owner, repo, nil)
 	if err != nil {
@@ -233,18 +254,17 @@ func getReadme(ctx context.Context, client *github.Client, owner, repo string) (
 	if err != nil {
 		return "", err
 	}
-	return content, nil
-}
+	err = saveReadMe(content, owner, repo)
+	if err != nil {
+		return "", err
+	}
+	NewRepo := userRepoLink{
+		User:    owner,
+		Repo:    repo,
+		Checked: true,
+	}
+	comboUserRepo := fmt.Sprintf("%v%v", owner, repo)
 
-func extractAnchorText(line string) (string, error) {
-	// Extracts the text inbetween square braces
-	splitFirstBrace := strings.Split(line, "[")
-	if len(splitFirstBrace) < 2 {
-		return "", fmt.Errorf("failed to split at first brace input: %v", line)
-	}
-	splitSecondBrace := strings.Split(splitFirstBrace[1], "]")
-	if len(splitSecondBrace) < 2 {
-		return "", fmt.Errorf("failed to split at second brace input: %v", line)
-	}
-	return splitSecondBrace[0], nil
+	config.RepoMap[comboUserRepo] = NewRepo
+	return content, nil
 }
